@@ -27,10 +27,12 @@ import java.util.List;
 
 /**
  * Decompresses a {@link ByteBuf} encoded with the brotli format.
- *
+ * <p>
  * See <a href="https://github.com/google/brotli">brotli</a>.
  */
 public final class BrotliDecoder extends ByteToMessageDecoder {
+
+    private static final int DEFAULT_MAX_FORWARD_BYTES = 64 * 1024;
 
     private enum State {
         DONE, NEEDS_MORE_INPUT, ERROR
@@ -45,9 +47,11 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
     }
 
     private final int inputBufferSize;
+    private final int outputBufferSize;
     private DecoderJNI.Wrapper decoder;
     private boolean destroyed;
     private boolean needsRead;
+    private ByteBuf accumBuffer;
 
     /**
      * Creates a new BrotliDecoder with a default 8kB input buffer
@@ -61,16 +65,33 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
      * @param inputBufferSize desired size of the input buffer in bytes
      */
     public BrotliDecoder(int inputBufferSize) {
+        this(inputBufferSize, DEFAULT_MAX_FORWARD_BYTES);
+    }
+
+    /**
+     * Creates a new BrotliDecoder
+     * @param inputBufferSize desired size of the input buffer in bytes
+     * @param outputBufferSize desired max size of the output buffer in bytes
+     *                         (produce multiple output buffers if exceeded)
+     */
+    public BrotliDecoder(int inputBufferSize, int outputBufferSize) {
         this.inputBufferSize = ObjectUtil.checkPositive(inputBufferSize, "inputBufferSize");
+        this.outputBufferSize = ObjectUtil.checkPositive(outputBufferSize, "outputBufferSize");
     }
 
     private void forwardOutput(ChannelHandlerContext ctx) {
         ByteBuffer nativeBuffer = decoder.pull();
         // nativeBuffer actually wraps brotli's internal buffer so we need to copy its content
-        ByteBuf copy = ctx.alloc().buffer(nativeBuffer.remaining());
-        copy.writeBytes(nativeBuffer);
+        int remaining = nativeBuffer.remaining();
+        if (accumBuffer == null) {
+            accumBuffer = ctx.alloc().buffer(remaining);
+        }
+        accumBuffer.writeBytes(nativeBuffer);
         needsRead = false;
-        ctx.fireChannelRead(copy);
+        if (accumBuffer.readableBytes() >= outputBufferSize) {
+            ctx.fireChannelRead(accumBuffer);
+            accumBuffer = null;
+        }
     }
 
     private State decompress(ChannelHandlerContext ctx, ByteBuf input) {
@@ -138,6 +159,11 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
         try {
             State state = decompress(ctx, in);
             if (state == State.DONE) {
+                // Flush any remaining accumulated data
+                if (accumBuffer != null && accumBuffer.isReadable()) {
+                    ctx.fireChannelRead(accumBuffer);
+                    accumBuffer = null;
+                }
                 destroy();
             } else if (state == State.ERROR) {
                 throw new DecompressionException("Brotli stream corrupted");
@@ -152,6 +178,10 @@ public final class BrotliDecoder extends ByteToMessageDecoder {
         if (!destroyed) {
             destroyed = true;
             decoder.destroy();
+        }
+        if (accumBuffer != null) {
+            accumBuffer.release();
+            accumBuffer = null;
         }
     }
 

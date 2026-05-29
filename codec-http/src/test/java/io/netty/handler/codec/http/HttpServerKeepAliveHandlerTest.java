@@ -212,6 +212,37 @@ public class HttpServerKeepAliveHandlerTest {
         assertFalse(channel.finishAndReleaseAll());
     }
 
+    @Test
+    public void testConnectionClosedWhenBothTransferEncodingAndContentLengthRfc7230() {
+        EmbeddedChannel ch = new EmbeddedChannel(
+                new HttpRequestDecoder(new HttpDecoderConfig().setUseRfc9112TransferEncoding(false)),
+                new HttpServerKeepAliveHandler());
+
+        String requestStr = "POST / HTTP/1.1\r\n" +
+                "Host: example.com\r\n" +
+                "Content-Length: 5\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "0\r\n\r\n";
+
+        assertTrue(ch.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+
+        HttpRequest request = ch.readInbound();
+        assertFalse(HttpUtil.isKeepAlive(request));
+        LastHttpContent content = ch.readInbound();
+        ReferenceCountUtil.release(content);
+
+        FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        setContentLength(response, 0);
+
+        ch.writeAndFlush(response);
+        HttpResponse writtenResponse = ch.readOutbound();
+
+        assertFalse(isKeepAlive(writtenResponse));
+        assertFalse(ch.isOpen());
+        ReferenceCountUtil.release(writtenResponse);
+        assertFalse(ch.finishAndReleaseAll());
+    }
+
     private static void setupMessageLength(HttpResponse response, int setSelfDefinedMessageLength) {
         switch (setSelfDefinedMessageLength) {
         case NOT_SELF_DEFINED_MSG_LENGTH:
